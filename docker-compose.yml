@@ -1,0 +1,28 @@
+services:
+  profile-identity-web:
+    build: .
+    command: python manage.py runserver 0.0.0.0:8002
+    volumes:
+      - .:/app
+    ports:
+      - "8002:8002"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - profile-identity-db
+    env_file:
+      - .env
+
+  profile-identity-db:
+    image: postgres:16
+    ports:
+      - "5434:5432"
+    volumes:
+      - profile_identity_postgres_data:/var/lib/postgresql/data/
+    environment:
+      - POSTGRES_DB=${DB_NAME:-profile_identity}
+      - POSTGRES_USER=${DB_USER:-profile_identity}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-profile_identity}
+
+volumes:
+  profile_identity_postgres_data:
