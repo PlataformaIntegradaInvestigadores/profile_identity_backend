@@ -1,13 +1,18 @@
-from django.contrib.auth.hashers import make_password
 from django.utils import timezone
 from rest_framework.exceptions import AuthenticationFailed
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer, TokenRefreshSerializer
 
+from .application.use_cases import (
+    create_group,
+    create_profile_information,
+    register_user,
+    update_profile_information,
+    update_user,
+)
 from .auth_sessions import create_auth_session, get_active_session_for_refresh, rotate_auth_session
-from .legacy_sync import legacy_sync_client
 from .models import Group, ProfileInformation, User
-from .profile_services import ensure_profile_information, normalize_contact_info, serialize_profile_for_sync
+from .profile_services import normalize_contact_info
 
 
 class UserListSerializer(serializers.ModelSerializer):
@@ -66,6 +71,11 @@ class UserSerializer(serializers.ModelSerializer):
             value = "http://" + value
         return value
 
+    def update(self, instance, validated_data):
+        request = self.context.get("request")
+        actor = request.user if request else instance
+        return update_user(actor, instance, validated_data)
+
 
 class UserDetailSerializer(serializers.ModelSerializer):
     class Meta:
@@ -94,11 +104,7 @@ class RegisterSerializer(serializers.ModelSerializer):
         fields = ["first_name", "last_name", "username", "scopus_id", "password"]
 
     def create(self, validated_data):
-        validated_data["password"] = make_password(validated_data["password"])
-        user = super().create(validated_data)
-        legacy_sync_client.post("/internal/profile-sync/users/", serialize_user_for_sync(user))
-        ensure_profile_information(user)
-        return user
+        return register_user(validated_data)
 
 
 class ProfileInformationSerializer(serializers.ModelSerializer):
@@ -116,20 +122,12 @@ class ProfileInformationSerializer(serializers.ModelSerializer):
         return normalize_contact_info(value)
 
     def update(self, instance, validated_data):
-        instance = super().update(instance, validated_data)
-        legacy_sync_client.post(
-            "/internal/profile-sync/profile-information/",
-            serialize_profile_for_sync(instance),
-        )
-        return instance
+        request = self.context.get("request")
+        actor = request.user if request else instance.user
+        return update_profile_information(actor, instance, validated_data)
 
     def create(self, validated_data):
-        instance = super().create(validated_data)
-        legacy_sync_client.post(
-            "/internal/profile-sync/profile-information/",
-            serialize_profile_for_sync(instance),
-        )
-        return instance
+        return create_profile_information(validated_data)
 
 
 class GroupSerializer(serializers.ModelSerializer):
@@ -142,13 +140,7 @@ class GroupSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         request = self.context.get("request")
-        validated_data["admin"] = request.user
-        users = validated_data.pop("users", [])
-        group = Group.objects.create(**validated_data)
-        group.users.add(request.user)
-        group.users.add(*users)
-        sync_group(group)
-        return group
+        return create_group(request.user, validated_data)
 
 
 class UserGroupSerializer(serializers.ModelSerializer):
@@ -165,42 +157,3 @@ class GroupDetailSerializer(serializers.ModelSerializer):
         model = Group
         fields = ["id", "title", "description", "admin_id", "users", "voting_type"]
         read_only_fields = ["id", "admin_id"]
-
-
-def serialize_user_for_sync(user):
-    return {
-        "id": user.id,
-        "first_name": user.first_name,
-        "last_name": user.last_name,
-        "username": user.username,
-        "password": user.password,
-        "scopus_id": user.scopus_id,
-        "investigation_camp": user.investigation_camp,
-        "institution": user.institution,
-        "email_institution": user.email_institution,
-        "website": user.website,
-        "profile_picture": str(user.profile_picture or ""),
-        "is_active": user.is_active,
-        "is_staff": user.is_staff,
-        "interests": user.interests,
-        "interaction_count": user.interaction_count,
-    }
-
-
-def serialize_group_for_sync(group):
-    return {
-        "id": group.id,
-        "title": group.title,
-        "description": group.description,
-        "admin_id": group.admin_id,
-        "voting_type": group.voting_type,
-        "users": list(group.users.values_list("id", flat=True)),
-    }
-
-
-def sync_group(group):
-    legacy_sync_client.post("/internal/profile-sync/groups/", serialize_group_for_sync(group))
-    legacy_sync_client.post(
-        "/internal/profile-sync/group-memberships/",
-        {"group_id": group.id, "users": list(group.users.values_list("id", flat=True))},
-    )

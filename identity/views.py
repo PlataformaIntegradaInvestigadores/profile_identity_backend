@@ -10,8 +10,16 @@ from rest_framework_simplejwt.exceptions import AuthenticationFailed, InvalidTok
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
+from .application.use_cases import (
+    delete_group,
+    delete_profile_information,
+    leave_group,
+    remove_group_member,
+    validate_group_visibility,
+)
 from .auth_sessions import revoke_session_for_refresh
-from .legacy_sync import legacy_sync_client
+from .domain.exceptions import DomainPermissionDenied, DomainRuleViolation, DomainValidationError
+from .domain.policies import ensure_can_edit_user
 from .models import Group, ProfileInformation, User
 from .profile_services import ensure_profile_information
 from .serializers import (
@@ -24,8 +32,15 @@ from .serializers import (
     UserSerializer,
     SessionTokenRefreshSerializer,
     UserTokenObtainPairSerializer,
-    sync_group,
 )
+
+
+def raise_drf_domain_exception(exc):
+    if isinstance(exc, DomainPermissionDenied):
+        raise PermissionDenied(str(exc)) from exc
+    if isinstance(exc, DomainValidationError):
+        raise ValidationError({"detail": str(exc)}) from exc
+    raise exc
 
 
 class HealthLiveView(APIView):
@@ -51,33 +66,18 @@ class UserUpdateView(generics.UpdateAPIView):
 
     def get_object(self):
         obj = super().get_object()
-        if obj.id != self.request.user.id:
-            raise PermissionDenied("No tienes permiso para editar este usuario.")
+        try:
+            ensure_can_edit_user(self.request.user, obj)
+        except DomainRuleViolation as exc:
+            raise_drf_domain_exception(exc)
         return obj
 
     def update(self, request, *args, **kwargs):
         kwargs["partial"] = True
-        response = super().update(request, *args, **kwargs)
-        user = self.get_object()
-        legacy_sync_client.post(
-            "/internal/profile-sync/users/",
-            {
-                "id": user.id,
-                "first_name": user.first_name,
-                "last_name": user.last_name,
-                "username": user.username,
-                "password": user.password,
-                "scopus_id": user.scopus_id,
-                "investigation_camp": user.investigation_camp,
-                "institution": user.institution,
-                "email_institution": user.email_institution,
-                "website": user.website,
-                "profile_picture": str(user.profile_picture or ""),
-                "is_active": user.is_active,
-                "is_staff": user.is_staff,
-            },
-        )
-        return response
+        try:
+            return super().update(request, *args, **kwargs)
+        except DomainRuleViolation as exc:
+            raise_drf_domain_exception(exc)
 
 
 class UserTokenObtainPairView(TokenObtainPairView):
@@ -211,24 +211,16 @@ class ProfileInformationDetailView(generics.RetrieveUpdateDestroyAPIView):
         return ensure_profile_information(self.request.user)
 
     def perform_update(self, serializer):
-        if self.request.user.id != serializer.instance.user.id:
-            raise PermissionDenied("No tienes permiso para editar este perfil.")
-        serializer.save()
+        try:
+            serializer.save()
+        except DomainRuleViolation as exc:
+            raise_drf_domain_exception(exc)
 
     def perform_destroy(self, instance):
-        if self.request.user.id != instance.user.id:
-            raise PermissionDenied("No tienes permiso para eliminar este perfil.")
-        if not instance.about_me and not instance.disciplines and not instance.contact_info:
-            instance.delete()
-            legacy_sync_client.post(
-                "/internal/profile-sync/profile-information/",
-                {"user_id": instance.user_id, "deleted": True},
-            )
-        else:
-            return Response(
-                {"detail": "La informacion del perfil debe estar vacia para ser eliminada."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        try:
+            delete_profile_information(self.request.user, instance)
+        except DomainRuleViolation as exc:
+            raise_drf_domain_exception(exc)
 
 
 class PublicProfileInformationDetailView(generics.RetrieveAPIView):
@@ -263,12 +255,11 @@ class GroupDeleteView(generics.DestroyAPIView):
 
     def delete(self, request, *args, **kwargs):
         group = self.get_object()
-        if group.admin != request.user:
-            return Response({"detail": "You do not have permission to delete this group."}, status=status.HTTP_403_FORBIDDEN)
-        group_id = group.id
-        response = self.destroy(request, *args, **kwargs)
-        legacy_sync_client.post("/internal/profile-sync/groups/", {"id": group_id, "deleted": True})
-        return response
+        try:
+            delete_group(request.user, group)
+        except DomainRuleViolation as exc:
+            raise_drf_domain_exception(exc)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class GroupLeaveView(generics.GenericAPIView):
@@ -277,10 +268,10 @@ class GroupLeaveView(generics.GenericAPIView):
 
     def post(self, request, *args, **kwargs):
         group = self.get_object()
-        if request.user == group.admin:
-            return Response({"detail": "Admin cannot leave the group. You must delete the group."}, status=status.HTTP_400_BAD_REQUEST)
-        group.users.remove(request.user)
-        sync_group(group)
+        try:
+            leave_group(request.user, group)
+        except DomainRuleViolation as exc:
+            raise_drf_domain_exception(exc)
         return Response({"detail": "You have left the group."}, status=status.HTTP_200_OK)
 
 
@@ -297,9 +288,11 @@ class GroupDetailView(generics.RetrieveAPIView):
 
     def get(self, request, *args, **kwargs):
         group = self.get_object()
-        if group.admin == request.user or group.users.filter(id=request.user.id).exists():
-            return Response(self.get_serializer(group).data)
-        raise PermissionDenied("You do not have permission to access this group.")
+        try:
+            validate_group_visibility(request.user, group)
+        except DomainRuleViolation as exc:
+            raise_drf_domain_exception(exc)
+        return Response(self.get_serializer(group).data)
 
 
 class RemoveMemberView(generics.GenericAPIView):
@@ -313,10 +306,8 @@ class RemoveMemberView(generics.GenericAPIView):
             user_to_remove = User.objects.get(id=user_id)
         except User.DoesNotExist:
             return Response({"detail": "User does not exist."}, status=status.HTTP_404_NOT_FOUND)
-        if group.admin != request.user:
-            return Response({"detail": "You do not have permission to remove this member."}, status=status.HTTP_403_FORBIDDEN)
-        if user_to_remove == request.user:
-            return Response({"detail": "You cannot remove yourself from the group."}, status=status.HTTP_400_BAD_REQUEST)
-        group.users.remove(user_to_remove)
-        sync_group(group)
+        try:
+            remove_group_member(request.user, group, user_to_remove)
+        except DomainRuleViolation as exc:
+            raise_drf_domain_exception(exc)
         return Response({"detail": "Member removed successfully."}, status=status.HTTP_200_OK)
