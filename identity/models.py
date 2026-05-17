@@ -181,6 +181,72 @@ class AuthSession(models.Model):
         ]
 
 
+class UserMFASettings(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="mfa_settings")
+    mfa_enabled = models.BooleanField(default=False)
+    mfa_secret_encrypted = models.TextField(null=True, blank=True)
+    pending_mfa_secret_encrypted = models.TextField(null=True, blank=True)
+    mfa_confirmed_at = models.DateTimeField(null=True, blank=True)
+    failed_attempts = models.PositiveIntegerField(default=0)
+    locked_until = models.DateTimeField(null=True, blank=True)
+    last_used_totp_step = models.BigIntegerField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    @property
+    def is_locked(self):
+        return self.locked_until is not None and self.locked_until > timezone.now()
+
+    def reset_failures(self):
+        self.failed_attempts = 0
+        self.locked_until = None
+        self.save(update_fields=["failed_attempts", "locked_until", "updated_at"])
+
+    class Meta:
+        db_table = "user_mfa_settings"
+        indexes = [
+            models.Index(fields=["locked_until"], name="identity_mfa_locked_until"),
+        ]
+
+
+class MFAChallenge(models.Model):
+    class Purpose(models.TextChoices):
+        LOGIN = "login", "Login"
+        ENROLLMENT = "enrollment", "Enrollment"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="mfa_challenges")
+    challenge_token_hash = models.CharField(max_length=64, unique=True)
+    purpose = models.CharField(max_length=20, choices=Purpose.choices)
+    expires_at = models.DateTimeField()
+    used_at = models.DateTimeField(null=True, blank=True)
+    failed_attempts = models.PositiveIntegerField(default=0)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.CharField(max_length=512, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    @property
+    def is_expired(self):
+        return self.expires_at <= timezone.now()
+
+    @property
+    def is_active(self):
+        return self.used_at is None and not self.is_expired
+
+    def mark_used(self):
+        if self.used_at is None:
+            self.used_at = timezone.now()
+            self.save(update_fields=["used_at"])
+
+    class Meta:
+        db_table = "mfa_challenges"
+        indexes = [
+            models.Index(fields=["user", "purpose", "used_at"], name="identity_mfa_challenge_user"),
+            models.Index(fields=["expires_at"], name="identity_mfa_challenge_exp"),
+        ]
+
+
 class LegacySyncOutbox(models.Model):
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
