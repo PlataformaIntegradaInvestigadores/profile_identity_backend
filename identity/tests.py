@@ -132,6 +132,23 @@ class IdentityApiTests(APITestCase):
         user = User.objects.get(username="maria@example.com")
         self.assertTrue(ProfileInformation.objects.filter(user=user).exists())
 
+    def test_register_rejects_weak_numeric_password(self):
+        response = self.client.post(
+            "/api/register/",
+            {
+                "first_name": "Carlos",
+                "last_name": "Lopez",
+                "username": "carlos@example.com",
+                "password": "123456789",
+                "scopus_id": "67890",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("password", response.data["errors"])
+        self.assertFalse(User.objects.filter(username="carlos@example.com").exists())
+
     def test_public_profile_information_creates_empty_profile_for_existing_user(self):
         self.assertFalse(ProfileInformation.objects.filter(user=self.other).exists())
 
