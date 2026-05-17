@@ -1,5 +1,7 @@
 from django.conf import settings
 from django.contrib.auth import authenticate
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.utils import timezone
 from rest_framework.exceptions import AuthenticationFailed
@@ -299,6 +301,19 @@ class RegisterSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = ["first_name", "last_name", "username", "scopus_id", "password"]
+
+    def validate(self, attrs):
+        user = User(
+            first_name=attrs.get("first_name", ""),
+            last_name=attrs.get("last_name", ""),
+            username=attrs.get("username", ""),
+            scopus_id=attrs.get("scopus_id"),
+        )
+        try:
+            validate_password(attrs.get("password"), user=user)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError({"password": list(exc.messages)}) from exc
+        return attrs
 
     def create(self, validated_data):
         return register_user(validated_data)
