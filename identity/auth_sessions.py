@@ -70,6 +70,7 @@ def get_active_session_for_refresh(raw_refresh_token: str) -> AuthSession | None
             refresh_token_hash=token_hash,
             revoked_at__isnull=True,
             expires_at__gt=timezone.now(),
+            user__is_active=True,
         )
         .first()
     )

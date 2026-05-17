@@ -17,14 +17,18 @@ from .application.use_cases import (
     remove_group_member,
     validate_group_visibility,
 )
-from .auth_sessions import revoke_session_for_refresh
+from .auth_sessions import create_auth_session, revoke_session_for_refresh
 from .domain.exceptions import DomainPermissionDenied, DomainRuleViolation, DomainValidationError
 from .domain.policies import ensure_can_edit_user
-from .models import Group, ProfileInformation, User
+from .models import Group, ProfileInformation, User, UserMFASettings
 from .profile_services import ensure_profile_information
 from .serializers import (
     GroupDetailSerializer,
     GroupSerializer,
+    MFAConfirmSerializer,
+    MFASetupSerializer,
+    MFAStatusSerializer,
+    MFAVerifySerializer,
     ProfileInformationSerializer,
     RegisterSerializer,
     UserGroupSerializer,
@@ -94,6 +98,50 @@ class UserTokenObtainPairView(TokenObtainPairView):
         return response
 
 
+class MFASetupView(APIView):
+    authentication_classes = []
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        serializer = MFASetupSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        return Response(serializer.save(), status=status.HTTP_200_OK)
+
+
+class MFAConfirmView(APIView):
+    authentication_classes = []
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        serializer = MFAConfirmSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        result = serializer.save()
+        return issue_final_auth_response(
+            user=result["user"],
+            request=request,
+            extra_data={"detail": result["detail"]},
+        )
+
+
+class MFAVerifyView(APIView):
+    authentication_classes = []
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        serializer = MFAVerifySerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        result = serializer.save()
+        return issue_final_auth_response(user=result["user"], request=request)
+
+
+class MFAStatusView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        mfa_settings, _ = UserMFASettings.objects.get_or_create(user=request.user)
+        return Response(MFAStatusSerializer(mfa_settings).data, status=status.HTTP_200_OK)
+
+
 class CustomTokenRefreshView(TokenRefreshView):
     serializer_class = SessionTokenRefreshSerializer
     authentication_classes = []
@@ -122,7 +170,9 @@ class LogoutView(APIView):
     def post(self, request):
         raw_refresh = request.data.get("refresh") or request.COOKIES.get(settings.JWT_REFRESH_COOKIE_NAME)
         if not raw_refresh:
-            return Response({"detail": "Refresh token is required."}, status=status.HTTP_400_BAD_REQUEST)
+            response = Response({"detail": "Refresh token is required."}, status=status.HTTP_400_BAD_REQUEST)
+            clear_refresh_cookie(response)
+            return response
         try:
             revoke_session_for_refresh(raw_refresh)
             RefreshToken(raw_refresh).blacklist()
@@ -158,15 +208,33 @@ class ValidateTokenView(APIView):
         return response
 
 
+def issue_final_auth_response(*, user, request, extra_data=None):
+    refresh = UserTokenObtainPairSerializer.get_token(user)
+    refresh["email"] = user.username
+    refresh["mfa"] = True
+    raw_refresh = str(refresh)
+
+    create_auth_session(user=user, raw_refresh_token=raw_refresh, request=request)
+
+    response_data = {"access": str(refresh.access_token)}
+    if extra_data:
+        response_data.update(extra_data)
+
+    response = Response(response_data, status=status.HTTP_200_OK)
+    set_refresh_cookie(response, raw_refresh)
+    return response
+
+
 def set_refresh_cookie(response, raw_refresh):
     response.set_cookie(
         settings.JWT_REFRESH_COOKIE_NAME,
         raw_refresh,
-        max_age=int(settings.SIMPLE_JWT["REFRESH_TOKEN_LIFETIME"].total_seconds()),
+        max_age=settings.JWT_REFRESH_COOKIE_MAX_AGE,
         httponly=settings.JWT_REFRESH_COOKIE_HTTPONLY,
         secure=settings.JWT_REFRESH_COOKIE_SECURE,
         samesite=settings.JWT_REFRESH_COOKIE_SAMESITE,
         path=settings.JWT_REFRESH_COOKIE_PATH,
+        domain=settings.JWT_REFRESH_COOKIE_DOMAIN,
     )
 
 
@@ -175,6 +243,7 @@ def clear_refresh_cookie(response):
         settings.JWT_REFRESH_COOKIE_NAME,
         path=settings.JWT_REFRESH_COOKIE_PATH,
         samesite=settings.JWT_REFRESH_COOKIE_SAMESITE,
+        domain=settings.JWT_REFRESH_COOKIE_DOMAIN,
     )
 
 
