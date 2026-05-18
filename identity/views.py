@@ -21,7 +21,9 @@ from .auth_sessions import create_auth_session, revoke_session_for_refresh
 from .domain.exceptions import DomainPermissionDenied, DomainRuleViolation, DomainValidationError
 from .domain.policies import ensure_can_edit_user
 from .models import Group, ProfileInformation, User, UserMFASettings
+from .metrics import prometheus_metrics_response
 from .profile_services import ensure_profile_information
+from .security_events import emit_security_event
 from .serializers import (
     GroupDetailSerializer,
     GroupSerializer,
@@ -52,6 +54,14 @@ class HealthLiveView(APIView):
 
     def get(self, request):
         return Response({"status": "alive"})
+
+
+class MetricsView(APIView):
+    authentication_classes = []
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        return prometheus_metrics_response()
 
 
 class UserListView(generics.ListAPIView):
@@ -104,8 +114,28 @@ class MFASetupView(APIView):
 
     def post(self, request):
         serializer = MFASetupSerializer(data=request.data, context={"request": request})
-        serializer.is_valid(raise_exception=True)
-        return Response(serializer.save(), status=status.HTTP_200_OK)
+        try:
+            serializer.is_valid(raise_exception=True)
+            data = serializer.save()
+        except ValidationError:
+            emit_security_event(
+                event_type="mfa_setup_failed",
+                severity="warning",
+                outcome="failure",
+                request=request,
+                status_code=status.HTTP_400_BAD_REQUEST,
+                reason="invalid_mfa_setup",
+            )
+            raise
+        emit_security_event(
+            event_type="mfa_setup_started",
+            severity="info",
+            outcome="pending",
+            request=request,
+            status_code=status.HTTP_200_OK,
+            user=serializer.user,
+        )
+        return Response(data, status=status.HTTP_200_OK)
 
 
 class MFAConfirmView(APIView):
@@ -116,6 +146,14 @@ class MFAConfirmView(APIView):
         serializer = MFAConfirmSerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
         result = serializer.save()
+        emit_security_event(
+            event_type="mfa_enabled",
+            severity="info",
+            outcome="success",
+            request=request,
+            status_code=status.HTTP_200_OK,
+            user=result["user"],
+        )
         return issue_final_auth_response(
             user=result["user"],
             request=request,
@@ -131,6 +169,14 @@ class MFAVerifyView(APIView):
         serializer = MFAVerifySerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
         result = serializer.save()
+        emit_security_event(
+            event_type="mfa_success",
+            severity="info",
+            outcome="success",
+            request=request,
+            status_code=status.HTTP_200_OK,
+            user=result["user"],
+        )
         return issue_final_auth_response(user=result["user"], request=request)
 
 
@@ -139,6 +185,15 @@ class MFAStatusView(APIView):
 
     def get(self, request):
         mfa_settings, _ = UserMFASettings.objects.get_or_create(user=request.user)
+        emit_security_event(
+            event_type="mfa_status_checked",
+            severity="info",
+            outcome="success",
+            request=request,
+            status_code=status.HTTP_200_OK,
+            user=request.user,
+            mfa_enabled=mfa_settings.mfa_enabled,
+        )
         return Response(MFAStatusSerializer(mfa_settings).data, status=status.HTTP_200_OK)
 
 
@@ -154,12 +209,33 @@ class CustomTokenRefreshView(TokenRefreshView):
             if cookie_refresh:
                 data["refresh"] = cookie_refresh
         serializer = self.get_serializer(data=data)
-        serializer.is_valid(raise_exception=True)
+        try:
+            serializer.is_valid(raise_exception=True)
+        except AuthenticationFailed:
+            emit_security_event(
+                event_type="refresh_failed",
+                severity="warning",
+                outcome="failure",
+                request=request,
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                reason="invalid_or_inactive_refresh_session",
+            )
+            raise
         response = Response(serializer.validated_data, status=status.HTTP_200_OK)
         raw_refresh = response.data.get("refresh")
         if raw_refresh:
             set_refresh_cookie(response, raw_refresh)
             response.data.pop("refresh", None)
+        auth_session = getattr(serializer, "auth_session", None)
+        emit_security_event(
+            event_type="refresh_success",
+            severity="info",
+            outcome="success",
+            request=request,
+            status_code=status.HTTP_200_OK,
+            user=auth_session.user if auth_session else None,
+            auth_session_id=str(auth_session.id) if auth_session else None,
+        )
         return response
 
 
@@ -172,16 +248,47 @@ class LogoutView(APIView):
         if not raw_refresh:
             response = Response({"detail": "Refresh token is required."}, status=status.HTTP_400_BAD_REQUEST)
             clear_refresh_cookie(response)
+            emit_security_event(
+                event_type="refresh_failed",
+                severity="warning",
+                outcome="failure",
+                request=request,
+                status_code=status.HTTP_400_BAD_REQUEST,
+                reason="missing_refresh_on_logout",
+            )
             return response
         try:
-            revoke_session_for_refresh(raw_refresh)
+            session_revoked = revoke_session_for_refresh(raw_refresh)
             RefreshToken(raw_refresh).blacklist()
         except TokenError:
             response = Response({"detail": "Invalid refresh token."}, status=status.HTTP_400_BAD_REQUEST)
             clear_refresh_cookie(response)
+            emit_security_event(
+                event_type="refresh_failed",
+                severity="warning",
+                outcome="failure",
+                request=request,
+                status_code=status.HTTP_400_BAD_REQUEST,
+                reason="invalid_refresh_on_logout",
+            )
             return response
         response = Response(status=status.HTTP_204_NO_CONTENT)
         clear_refresh_cookie(response)
+        if session_revoked:
+            emit_security_event(
+                event_type="session_revoked",
+                severity="info",
+                outcome="success",
+                request=request,
+                status_code=status.HTTP_204_NO_CONTENT,
+            )
+        emit_security_event(
+            event_type="logout_success",
+            severity="info",
+            outcome="success",
+            request=request,
+            status_code=status.HTTP_204_NO_CONTENT,
+        )
         return response
 
 
@@ -193,18 +300,59 @@ class ValidateTokenView(APIView):
         try:
             authentication_result = JWTAuthentication().authenticate(request)
         except (AuthenticationFailed, InvalidToken, TokenError):
+            emit_security_event(
+                event_type="invalid_token",
+                severity="warning",
+                outcome="failure",
+                request=request,
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                reason="invalid_or_expired_token",
+            )
             return Response({"detail": "Invalid or expired token."}, status=status.HTTP_401_UNAUTHORIZED)
         if authentication_result is None:
+            emit_security_event(
+                event_type="invalid_token",
+                severity="warning",
+                outcome="failure",
+                request=request,
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                reason="missing_token",
+            )
             return Response({"detail": "Authentication credentials were not provided."}, status=status.HTTP_401_UNAUTHORIZED)
         user, validated_token = authentication_result
         if not user or not user.is_authenticated:
+            emit_security_event(
+                event_type="invalid_token",
+                severity="warning",
+                outcome="failure",
+                request=request,
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                reason="invalid_token_user",
+            )
             return Response({"detail": "Invalid token user."}, status=status.HTTP_401_UNAUTHORIZED)
         if not user.is_active:
+            emit_security_event(
+                event_type="invalid_token",
+                severity="warning",
+                outcome="failure",
+                request=request,
+                status_code=status.HTTP_403_FORBIDDEN,
+                user=user,
+                reason="inactive_user",
+            )
             return Response({"detail": "Inactive user."}, status=status.HTTP_403_FORBIDDEN)
 
         response = Response(status=status.HTTP_204_NO_CONTENT)
         response["X-Authenticated-User-Id"] = str(user.id)
         response["X-Authenticated-Token-Type"] = str(validated_token.get("token_type", ""))
+        emit_security_event(
+            event_type="token_validated",
+            severity="info",
+            outcome="success",
+            request=request,
+            status_code=status.HTTP_204_NO_CONTENT,
+            user=user,
+        )
         return response
 
 
@@ -214,7 +362,7 @@ def issue_final_auth_response(*, user, request, extra_data=None):
     refresh["mfa"] = True
     raw_refresh = str(refresh)
 
-    create_auth_session(user=user, raw_refresh_token=raw_refresh, request=request)
+    auth_session = create_auth_session(user=user, raw_refresh_token=raw_refresh, request=request)
 
     response_data = {"access": str(refresh.access_token)}
     if extra_data:
@@ -222,6 +370,15 @@ def issue_final_auth_response(*, user, request, extra_data=None):
 
     response = Response(response_data, status=status.HTTP_200_OK)
     set_refresh_cookie(response, raw_refresh)
+    emit_security_event(
+        event_type="login_success",
+        severity="info",
+        outcome="success",
+        request=request,
+        status_code=status.HTTP_200_OK,
+        user=user,
+        auth_session_id=str(auth_session.id),
+    )
     return response
 
 
@@ -264,8 +421,26 @@ class RegisterView(generics.CreateAPIView):
             serializer.is_valid(raise_exception=True)
             self.perform_create(serializer)
             headers = self.get_success_headers(serializer.data)
+            emit_security_event(
+                event_type="user_registered",
+                severity="info",
+                outcome="success",
+                request=request,
+                status_code=status.HTTP_201_CREATED,
+                user=serializer.instance,
+            )
             return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
         except ValidationError:
+            if "password" in serializer.errors:
+                emit_security_event(
+                    event_type="password_rejected",
+                    severity="warning",
+                    outcome="failure",
+                    request=request,
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    reason="password_validation_failed",
+                    username=request.data.get("username"),
+                )
             return Response({"errors": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as exc:
             return Response({"error": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

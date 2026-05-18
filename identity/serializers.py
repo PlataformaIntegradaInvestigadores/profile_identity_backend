@@ -5,7 +5,7 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.utils import timezone
 from rest_framework.exceptions import AuthenticationFailed
-from rest_framework import serializers
+from rest_framework import serializers, status
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer, TokenRefreshSerializer
 
@@ -20,6 +20,7 @@ from .auth_sessions import create_auth_session, get_active_session_for_refresh, 
 from .mfa_services import (
     GENERIC_MFA_ERROR,
     MFAServiceError,
+    MFALockedError,
     activate_pending_mfa_secret,
     create_mfa_challenge,
     create_pending_enrollment_secret,
@@ -33,6 +34,7 @@ from .mfa_services import (
 )
 from .models import Group, MFAChallenge, ProfileInformation, User, UserMFASettings
 from .profile_services import normalize_contact_info
+from .security_events import emit_security_event
 
 
 class UserListSerializer(serializers.ModelSerializer):
@@ -54,10 +56,28 @@ class UserTokenObtainPairSerializer(TokenObtainPairSerializer):
         password = attrs.get("password")
         self.user = authenticate(request=request, **{self.username_field: username, "password": password})
         if self.user is None or not self.user.is_active:
+            emit_security_event(
+                event_type="login_failed",
+                severity="warning",
+                outcome="failure",
+                request=request,
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                reason="invalid_credentials",
+                username=username,
+            )
             raise AuthenticationFailed(GENERIC_MFA_ERROR, code="authorization")
 
         mfa_settings, _ = UserMFASettings.objects.get_or_create(user=self.user)
         if mfa_settings.is_locked:
+            emit_security_event(
+                event_type="account_locked",
+                severity="warning",
+                outcome="blocked",
+                request=request,
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                user=self.user,
+                reason="mfa_locked",
+            )
             raise AuthenticationFailed(GENERIC_MFA_ERROR, code="authorization")
 
         if mfa_settings.mfa_enabled:
@@ -65,6 +85,14 @@ class UserTokenObtainPairSerializer(TokenObtainPairSerializer):
                 user=self.user,
                 purpose=MFAChallenge.Purpose.LOGIN,
                 request=request,
+            )
+            emit_security_event(
+                event_type="mfa_required",
+                severity="info",
+                outcome="pending",
+                request=request,
+                status_code=status.HTTP_200_OK,
+                user=self.user,
             )
             return {
                 "status": "mfa_required",
@@ -79,6 +107,14 @@ class UserTokenObtainPairSerializer(TokenObtainPairSerializer):
                 purpose=MFAChallenge.Purpose.ENROLLMENT,
                 request=request,
             )
+            emit_security_event(
+                event_type="mfa_enrollment_required",
+                severity="info",
+                outcome="pending",
+                request=request,
+                status_code=status.HTTP_200_OK,
+                user=self.user,
+            )
             return {
                 "status": "mfa_enrollment_required",
                 "mfa_challenge": challenge.token,
@@ -87,6 +123,14 @@ class UserTokenObtainPairSerializer(TokenObtainPairSerializer):
 
         data = super().validate(attrs)
         create_auth_session(user=self.user, raw_refresh_token=data["refresh"], request=request)
+        emit_security_event(
+            event_type="login_success",
+            severity="info",
+            outcome="success",
+            request=request,
+            status_code=status.HTTP_200_OK,
+            user=self.user,
+        )
         return data
 
 
@@ -94,11 +138,12 @@ class MFASetupSerializer(serializers.Serializer):
     mfa_challenge = serializers.CharField(write_only=True, trim_whitespace=True)
 
     def save(self, **kwargs):
-        should_raise_failure = False
+        request = self.context.get("request")
         with transaction.atomic():
             challenge = _get_locked_mfa_challenge(
                 self.validated_data["mfa_challenge"],
                 MFAChallenge.Purpose.ENROLLMENT,
+                request=request,
             )
             mfa_settings, _ = UserMFASettings.objects.select_for_update().get_or_create(user=challenge.user)
             if mfa_settings.mfa_enabled:
@@ -123,11 +168,13 @@ class MFAConfirmSerializer(serializers.Serializer):
         return attrs
 
     def save(self, **kwargs):
+        request = self.context.get("request")
         should_raise_failure = False
         with transaction.atomic():
             challenge = _get_locked_mfa_challenge(
                 self.validated_data["mfa_challenge"],
                 MFAChallenge.Purpose.ENROLLMENT,
+                request=request,
             )
             mfa_settings, _ = UserMFASettings.objects.select_for_update().get_or_create(user=challenge.user)
 
@@ -139,11 +186,52 @@ class MFAConfirmSerializer(serializers.Serializer):
                     secret=pending_secret,
                     prevent_reuse=True,
                 )
+            except MFALockedError:
+                emit_security_event(
+                    event_type="account_locked",
+                    severity="warning",
+                    outcome="blocked",
+                    request=request,
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    user=challenge.user,
+                    reason="mfa_locked",
+                )
+                _raise_mfa_validation_error()
             except MFAServiceError:
+                emit_security_event(
+                    event_type="mfa_failed",
+                    severity="warning",
+                    outcome="failure",
+                    request=request,
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    user=challenge.user,
+                    reason="mfa_secret_error",
+                )
                 _raise_mfa_validation_error()
 
             if not validation.valid:
-                record_mfa_failure(mfa_settings=mfa_settings, challenge=challenge)
+                failure = record_mfa_failure(mfa_settings=mfa_settings, challenge=challenge)
+                emit_security_event(
+                    event_type="mfa_failed",
+                    severity="warning",
+                    outcome="failure",
+                    request=request,
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    user=challenge.user,
+                    reason="invalid_totp",
+                    failed_attempts=failure.failed_attempts,
+                    challenge_failed_attempts=failure.challenge_failed_attempts,
+                )
+                if failure.locked_until is not None:
+                    emit_security_event(
+                        event_type="account_locked",
+                        severity="warning",
+                        outcome="blocked",
+                        request=request,
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        user=challenge.user,
+                        reason="mfa_lockout_threshold",
+                    )
                 should_raise_failure = True
             else:
                 activate_pending_mfa_secret(mfa_settings=mfa_settings, timestep=validation.timestep)
@@ -165,11 +253,13 @@ class MFAVerifySerializer(serializers.Serializer):
         return attrs
 
     def save(self, **kwargs):
+        request = self.context.get("request")
         should_raise_failure = False
         with transaction.atomic():
             challenge = _get_locked_mfa_challenge(
                 self.validated_data["mfa_challenge"],
                 MFAChallenge.Purpose.LOGIN,
+                request=request,
             )
             mfa_settings, _ = UserMFASettings.objects.select_for_update().get_or_create(user=challenge.user)
 
@@ -181,11 +271,52 @@ class MFAVerifySerializer(serializers.Serializer):
                     secret=active_secret,
                     prevent_reuse=True,
                 )
+            except MFALockedError:
+                emit_security_event(
+                    event_type="account_locked",
+                    severity="warning",
+                    outcome="blocked",
+                    request=request,
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    user=challenge.user,
+                    reason="mfa_locked",
+                )
+                _raise_mfa_validation_error()
             except MFAServiceError:
+                emit_security_event(
+                    event_type="mfa_failed",
+                    severity="warning",
+                    outcome="failure",
+                    request=request,
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    user=challenge.user,
+                    reason="mfa_secret_error",
+                )
                 _raise_mfa_validation_error()
 
             if not validation.valid:
-                record_mfa_failure(mfa_settings=mfa_settings, challenge=challenge)
+                failure = record_mfa_failure(mfa_settings=mfa_settings, challenge=challenge)
+                emit_security_event(
+                    event_type="mfa_failed",
+                    severity="warning",
+                    outcome="failure",
+                    request=request,
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    user=challenge.user,
+                    reason="invalid_totp",
+                    failed_attempts=failure.failed_attempts,
+                    challenge_failed_attempts=failure.challenge_failed_attempts,
+                )
+                if failure.locked_until is not None:
+                    emit_security_event(
+                        event_type="account_locked",
+                        severity="warning",
+                        outcome="blocked",
+                        request=request,
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        user=challenge.user,
+                        reason="mfa_lockout_threshold",
+                    )
                 should_raise_failure = True
             else:
                 record_mfa_success(mfa_settings=mfa_settings, timestep=validation.timestep)
@@ -205,7 +336,7 @@ class MFAStatusSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
-def _get_locked_mfa_challenge(raw_token: str, purpose: str) -> MFAChallenge:
+def _get_locked_mfa_challenge(raw_token: str, purpose: str, request=None) -> MFAChallenge:
     challenge = (
         MFAChallenge.objects.select_for_update()
         .select_related("user")
@@ -215,7 +346,29 @@ def _get_locked_mfa_challenge(raw_token: str, purpose: str) -> MFAChallenge:
         )
         .first()
     )
-    if challenge is None or not challenge.is_active:
+    if challenge is None:
+        _raise_mfa_validation_error()
+    if not challenge.is_active:
+        if challenge.used_at is not None:
+            emit_security_event(
+                event_type="mfa_challenge_reused",
+                severity="warning",
+                outcome="failure",
+                request=request,
+                status_code=status.HTTP_400_BAD_REQUEST,
+                user=challenge.user,
+                reason="challenge_used",
+            )
+        elif challenge.is_expired:
+            emit_security_event(
+                event_type="mfa_challenge_expired",
+                severity="warning",
+                outcome="failure",
+                request=request,
+                status_code=status.HTTP_400_BAD_REQUEST,
+                user=challenge.user,
+                reason="challenge_expired",
+            )
         _raise_mfa_validation_error()
     return challenge
 
@@ -240,6 +393,7 @@ class SessionTokenRefreshSerializer(TokenRefreshSerializer):
             raise AuthenticationFailed("Refresh token session is not active.", code="token_not_valid") from exc
         if session is None:
             raise AuthenticationFailed("Refresh token session is not active.", code="token_not_valid")
+        self.auth_session = session
 
         data = super().validate(attrs)
         rotated_refresh = data.get("refresh")

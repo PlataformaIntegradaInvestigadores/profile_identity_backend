@@ -12,6 +12,9 @@ services:
       - profile-identity-db
     env_file:
       - .env
+    environment:
+      - DB_HOST=profile-identity-db
+      - DB_PORT=5432
 
   profile-identity-db:
     image: postgres:16
