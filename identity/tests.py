@@ -1,3 +1,4 @@
+import json
 from datetime import timedelta
 
 import pyotp
@@ -44,6 +45,39 @@ class IdentityApiTests(APITestCase):
     def test_login_adds_user_id_claim_compatible_with_frontend(self):
         token_response = self.authenticate()
         self.assertNotIn("refresh", token_response)
+
+    def test_request_id_header_is_reused_in_response(self):
+        response = self.client.get("/health/live/", HTTP_X_REQUEST_ID="req-test-123")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.headers["X-Request-ID"], "req-test-123")
+
+    def test_internal_metrics_endpoint_exposes_prometheus_text(self):
+        response = self.client.get("/internal/metrics/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("text/plain", response.headers["Content-Type"])
+        self.assertIn(b"identity_service_up", response.content)
+
+    def test_login_failed_emits_structured_security_event_without_secrets(self):
+        with self.assertLogs("security.events", level="INFO") as captured:
+            response = self.client.post(
+                "/api/token/",
+                {"username": "ana@example.com", "password": "WrongPass123"},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        events = _security_events(captured)
+        event = _event_by_type(events, "login_failed")
+        self.assertEqual(event["service"], "identity-backend")
+        self.assertEqual(event["outcome"], "failure")
+        self.assertEqual(event["status_code"], status.HTTP_401_UNAUTHORIZED)
+        self.assertIn("request_id", event)
+        self.assertNotIn("password", event)
+        self.assertNotIn("access", event)
+        self.assertNotIn("refresh", event)
+        self.assertNotIn("mfa_challenge", event)
 
     def test_login_creates_auth_session(self):
         self.authenticate()
@@ -133,21 +167,25 @@ class IdentityApiTests(APITestCase):
         self.assertTrue(ProfileInformation.objects.filter(user=user).exists())
 
     def test_register_rejects_weak_numeric_password(self):
-        response = self.client.post(
-            "/api/register/",
-            {
-                "first_name": "Carlos",
-                "last_name": "Lopez",
-                "username": "carlos@example.com",
-                "password": "123456789",
-                "scopus_id": "67890",
-            },
-            format="json",
-        )
+        with self.assertLogs("security.events", level="INFO") as captured:
+            response = self.client.post(
+                "/api/register/",
+                {
+                    "first_name": "Carlos",
+                    "last_name": "Lopez",
+                    "username": "carlos@example.com",
+                    "password": "123456789",
+                    "scopus_id": "67890",
+                },
+                format="json",
+            )
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("password", response.data["errors"])
         self.assertFalse(User.objects.filter(username="carlos@example.com").exists())
+        event = _event_by_type(_security_events(captured), "password_rejected")
+        self.assertEqual(event["reason"], "password_validation_failed")
+        self.assertNotIn("password", event)
 
     def test_public_profile_information_creates_empty_profile_for_existing_user(self):
         self.assertFalse(ProfileInformation.objects.filter(user=self.other).exists())
@@ -305,7 +343,8 @@ class MFASessionFlowTests(APITestCase):
         return response.data["mfa_challenge"]
 
     def test_login_without_mfa_requires_enrollment_and_does_not_create_session(self):
-        response = self.login()
+        with self.assertLogs("security.events", level="INFO") as captured:
+            response = self.login()
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["status"], "mfa_enrollment_required")
@@ -313,6 +352,10 @@ class MFASessionFlowTests(APITestCase):
         self.assertNotIn("access", response.data)
         self.assertNotIn(settings.JWT_REFRESH_COOKIE_NAME, response.cookies)
         self.assertFalse(AuthSession.objects.filter(user=self.user).exists())
+        event = _event_by_type(_security_events(captured), "mfa_enrollment_required")
+        self.assertEqual(event["outcome"], "pending")
+        self.assertEqual(event["user_id"], self.user.id)
+        self.assertNotIn("mfa_challenge", event)
 
     def test_mfa_setup_returns_enrollment_material_without_enabling_mfa(self):
         challenge = self.start_enrollment()
@@ -367,7 +410,8 @@ class MFASessionFlowTests(APITestCase):
         session_count = AuthSession.objects.filter(user=self.user).count()
         challenge = self.start_mfa_login()
 
-        response = self.verify_from_challenge(challenge, self.totp_code(manual_key, offset=1))
+        with self.assertLogs("security.events", level="INFO") as captured:
+            response = self.verify_from_challenge(challenge, self.totp_code(manual_key, offset=1))
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertIn("access", response.data)
@@ -375,6 +419,13 @@ class MFASessionFlowTests(APITestCase):
         self.assertIn(settings.JWT_REFRESH_COOKIE_NAME, response.cookies)
         self.assertEqual(AuthSession.objects.filter(user=self.user).count(), session_count + 1)
         self.assertTrue(AccessToken(response.data["access"])["mfa"])
+        events = _security_events(captured)
+        self.assertEqual(_event_by_type(events, "mfa_success")["outcome"], "success")
+        login_event = _event_by_type(events, "login_success")
+        self.assertEqual(login_event["outcome"], "success")
+        self.assertIn("auth_session_id", login_event)
+        self.assertNotIn("access", login_event)
+        self.assertNotIn("refresh", login_event)
 
     def test_invalid_totp_increments_mfa_and_challenge_attempts(self):
         manual_key, _ = self.enroll_user()
@@ -518,3 +569,14 @@ class LegacySyncOutboxTests(APITestCase):
         self.assertEqual(item.path, "/internal/profile-sync/users/")
         self.assertEqual(item.payload, {"id": "user-1"})
         self.assertEqual(item.status, LegacySyncOutbox.Status.PENDING)
+
+
+def _security_events(captured_logs):
+    return [json.loads(record.getMessage()) for record in captured_logs.records]
+
+
+def _event_by_type(events, event_type):
+    for event in events:
+        if event["event_type"] == event_type:
+            return event
+    raise AssertionError(f"Event {event_type} was not emitted. Events: {events}")

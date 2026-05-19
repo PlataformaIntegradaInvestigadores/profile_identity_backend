@@ -3,13 +3,14 @@ from django.conf.urls.static import static
 from django.contrib import admin
 from django.urls import include, path
 
-from identity.views import ValidateTokenView
+from identity.views import MetricsView, ValidateTokenView
 
 
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("api/", include("identity.urls")),
     path("internal/auth/validate-token/", ValidateTokenView.as_view(), name="validate-token"),
+    path("internal/metrics/", MetricsView.as_view(), name="internal-metrics"),
     path("health/live/", include("identity.health_urls")),
 ]
 

@@ -12,6 +12,12 @@ services:
       - profile-identity-db
     env_file:
       - .env
+    environment:
+      - DB_HOST=profile-identity-db
+      - DB_PORT=5432
+    networks:
+      - default
+      - centinela-net
 
   profile-identity-db:
     image: postgres:16
@@ -23,6 +29,13 @@ services:
       - POSTGRES_DB=${DB_NAME:-profile_identity}
       - POSTGRES_USER=${DB_USER:-profile_identity}
       - POSTGRES_PASSWORD=${DB_PASSWORD:-profile_identity}
+    networks:
+      - default
+      - centinela-net
 
 volumes:
   profile_identity_postgres_data:
+
+networks:
+  centinela-net:
+    external: true

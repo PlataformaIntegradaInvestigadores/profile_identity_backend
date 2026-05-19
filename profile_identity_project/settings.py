@@ -29,6 +29,8 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
+    "identity.middleware.RequestIDMiddleware",
+    "identity.middleware.PrometheusMetricsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -126,6 +128,7 @@ REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.AllowAny",
     ],
+    "EXCEPTION_HANDLER": "identity.exception_handlers.security_exception_handler",
 }
 
 LEGACY_SYNC_BASE_URL = os.getenv("LEGACY_SYNC_BASE_URL", "").rstrip("/")
@@ -155,11 +158,27 @@ MFA_LOCKOUT_MINUTES = [
 ]
 MFA_SECRET_ENCRYPTION_KEY = os.getenv("MFA_SECRET_ENCRYPTION_KEY", SECRET_KEY)
 
+SECURITY_LOG_SERVICE_NAME = os.getenv("SECURITY_LOG_SERVICE_NAME", "identity-backend")
+SECURITY_LOG_ENVIRONMENT = os.getenv("SECURITY_LOG_ENVIRONMENT", "dev")
+SECURITY_LOG_INCLUDE_USERNAME = os.getenv("SECURITY_LOG_INCLUDE_USERNAME", "True" if DEBUG else "False") == "True"
+METRICS_ENABLED = os.getenv("METRICS_ENABLED", "True") == "True"
+
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
-    "handlers": {"console": {"class": "logging.StreamHandler"}},
+    "formatters": {
+        "plain": {
+            "format": "%(message)s",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "plain",
+        }
+    },
     "loggers": {
         "identity": {"handlers": ["console"], "level": "INFO", "propagate": True},
+        "security.events": {"handlers": ["console"], "level": "INFO", "propagate": False},
     },
 }
