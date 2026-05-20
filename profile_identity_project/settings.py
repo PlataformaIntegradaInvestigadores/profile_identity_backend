@@ -161,6 +161,7 @@ MFA_SECRET_ENCRYPTION_KEY = os.getenv("MFA_SECRET_ENCRYPTION_KEY", SECRET_KEY)
 SECURITY_LOG_SERVICE_NAME = os.getenv("SECURITY_LOG_SERVICE_NAME", "identity-backend")
 SECURITY_LOG_ENVIRONMENT = os.getenv("SECURITY_LOG_ENVIRONMENT", "dev")
 SECURITY_LOG_INCLUDE_USERNAME = os.getenv("SECURITY_LOG_INCLUDE_USERNAME", "True" if DEBUG else "False") == "True"
+DJANGO_ACCESS_LOGS_ENABLED = os.getenv("DJANGO_ACCESS_LOGS_ENABLED", "False") == "True"
 METRICS_ENABLED = os.getenv("METRICS_ENABLED", "True") == "True"
 
 LOGGING = {
@@ -175,10 +176,18 @@ LOGGING = {
         "console": {
             "class": "logging.StreamHandler",
             "formatter": "plain",
-        }
+        },
+        "null": {
+            "class": "logging.NullHandler",
+        },
     },
     "loggers": {
         "identity": {"handlers": ["console"], "level": "INFO", "propagate": True},
         "security.events": {"handlers": ["console"], "level": "INFO", "propagate": False},
+        "django.server": {
+            "handlers": ["console"] if DJANGO_ACCESS_LOGS_ENABLED else ["null"],
+            "level": "INFO",
+            "propagate": False,
+        },
     },
 }
