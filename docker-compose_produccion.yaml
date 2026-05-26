@@ -1,0 +1,59 @@
+# Uso sugerido:
+# docker compose --env-file .env_produccion -f docker-compose_produccion.yaml up -d
+
+services:
+  profile-identity-web:
+    build: .
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command: gunicorn profile_identity_project.wsgi:application --bind 0.0.0.0:8002 --workers 2 --threads 2 --timeout 60
+    expose:
+      - "8002"
+    depends_on:
+      profile-identity-db:
+        condition: service_healthy
+    env_file:
+      - path: .env_produccion
+        required: false
+    environment:
+      - DB_HOST=profile-identity-db
+      - DB_PORT=5432
+      - USE_SQLITE_FOR_TESTS=False
+    volumes:
+      - identity_media:/app/media
+    networks:
+      centinela-net:
+        aliases:
+          - profile-identity-web
+
+  profile-identity-db:
+    image: postgres:16
+    restart: unless-stopped
+    expose:
+      - "5432"
+    volumes:
+      - profile_identity_postgres_data:/var/lib/postgresql/data/
+    environment:
+      - POSTGRES_DB=${DB_NAME:-profile_identity}
+      - POSTGRES_USER=${DB_USER:-profile_identity_app}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-change-me-strong-db-password}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-profile_identity_app} -d ${DB_NAME:-profile_identity}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      centinela-net:
+        aliases:
+          - profile-identity-db
+
+volumes:
+  profile_identity_postgres_data:
+    name: centinela_identity_postgres_data
+  identity_media:
+    name: centinela_identity_media
+
+networks:
+  centinela-net:
+    external: true
