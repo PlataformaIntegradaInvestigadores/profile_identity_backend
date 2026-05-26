@@ -405,7 +405,19 @@ class SessionTokenRefreshSerializer(TokenRefreshSerializer):
         return data
 
 
+class RelativeImageField(serializers.ImageField):
+    def to_representation(self, value):
+        if not value:
+            return None
+        try:
+            return value.url
+        except ValueError:
+            return None
+
+
 class UserSerializer(serializers.ModelSerializer):
+    profile_picture = RelativeImageField(required=False, allow_null=True)
+
     class Meta:
         model = User
         fields = [
@@ -431,6 +443,8 @@ class UserSerializer(serializers.ModelSerializer):
 
 
 class UserDetailSerializer(serializers.ModelSerializer):
+    profile_picture = RelativeImageField(read_only=True)
+
     class Meta:
         model = User
         fields = [
