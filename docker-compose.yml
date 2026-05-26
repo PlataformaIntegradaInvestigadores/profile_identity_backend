@@ -1,6 +1,7 @@
 services:
   profile-identity-web:
     build: .
+    restart: unless-stopped
     command: python manage.py runserver 0.0.0.0:8002
     volumes:
       - .:/app
@@ -21,6 +22,7 @@ services:
 
   profile-identity-db:
     image: postgres:16
+    restart: unless-stopped
     ports:
       - "5434:5432"
     volumes:
