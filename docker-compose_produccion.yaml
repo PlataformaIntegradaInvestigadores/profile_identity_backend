@@ -36,10 +36,10 @@ services:
       - profile_identity_postgres_data:/var/lib/postgresql/data/
     environment:
       - POSTGRES_DB=${DB_NAME:-profile_identity}
-      - POSTGRES_USER=${DB_USER:-profile_identity_app}
-      - POSTGRES_PASSWORD=${DB_PASSWORD:-change-me-strong-db-password}
+      - POSTGRES_USER=${DB_ADMIN_USER:-postgres}
+      - POSTGRES_PASSWORD=${DB_ADMIN_PASSWORD:-change-me-strong-db-admin-password}
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-profile_identity_app} -d ${DB_NAME:-profile_identity}"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_ADMIN_USER:-postgres} -d ${DB_NAME:-profile_identity}"]
       interval: 10s
       timeout: 5s
       retries: 5
