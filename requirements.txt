@@ -10,3 +10,4 @@ pyotp==2.9.0
 qrcode[pil]==7.4.2
 cryptography>=44.0.0
 prometheus-client>=0.22.0
+gunicorn==23.0.0

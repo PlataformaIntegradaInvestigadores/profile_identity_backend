@@ -2,11 +2,13 @@ services:
   profile-identity-web:
     build: .
     restart: unless-stopped
-    command: python manage.py runserver 0.0.0.0:8002
+    security_opt:
+      - no-new-privileges:true
+    command: gunicorn profile_identity_project.wsgi:application --bind 0.0.0.0:8002 --workers 1 --threads 2 --timeout 60
     volumes:
       - .:/app
     ports:
-      - "8002:8002"
+      - "127.0.0.1:8002:8002"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -24,7 +26,7 @@ services:
     image: postgres:16
     restart: unless-stopped
     ports:
-      - "5434:5432"
+      - "127.0.0.1:5434:5432"
     volumes:
       - profile_identity_postgres_data:/var/lib/postgresql/data/
     environment:
