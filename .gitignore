@@ -3,6 +3,7 @@
 *.env
 !.env.example
 .envrc
+.env_produccion*
 local_settings.py
 
 # Python
