@@ -14,7 +14,12 @@ from identity.mfa_services import encrypt_secret, hash_challenge_token
 from identity.models import AuthSession, Group, LegacySyncOutbox, MFAChallenge, ProfileInformation, User, UserMFASettings
 
 
-@override_settings(LEGACY_SYNC_ENABLED=False, MFA_ENFORCEMENT_MODE="optional")
+@override_settings(
+    LEGACY_SYNC_ENABLED=False,
+    MFA_ENFORCEMENT_MODE="optional",
+    AUTH_PASSWORD_LOCKOUT_FAILURE_THRESHOLD=3,
+    AUTH_PASSWORD_LOCKOUT_MINUTES=[5, 15],
+)
 class IdentityApiTests(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user(
@@ -78,6 +83,58 @@ class IdentityApiTests(APITestCase):
         self.assertNotIn("access", event)
         self.assertNotIn("refresh", event)
         self.assertNotIn("mfa_challenge", event)
+
+    def test_password_failures_apply_temporary_lockout(self):
+        for _ in range(settings.AUTH_PASSWORD_LOCKOUT_FAILURE_THRESHOLD - 1):
+            response = self.client.post(
+                "/api/token/",
+                {"username": "ana@example.com", "password": "WrongPass123"},
+                format="json",
+            )
+            self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        with self.assertLogs("security.events", level="INFO") as captured:
+            response = self.client.post(
+                "/api/token/",
+                {"username": "ana@example.com", "password": "WrongPass123"},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.failed_login_attempts, settings.AUTH_PASSWORD_LOCKOUT_FAILURE_THRESHOLD)
+        self.assertIsNotNone(self.user.password_locked_until)
+        self.assertGreater(self.user.password_locked_until, timezone.now())
+        lock_event = _event_by_type(_security_events(captured), "account_locked")
+        self.assertEqual(lock_event["reason"], "password_lockout_threshold")
+
+        locked_response = self.client.post(
+            "/api/token/",
+            {"username": "ana@example.com", "password": "StrongPass123"},
+            format="json",
+        )
+        self.assertEqual(locked_response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_successful_login_resets_password_failures(self):
+        response = self.client.post(
+            "/api/token/",
+            {"username": "ana@example.com", "password": "WrongPass123"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.failed_login_attempts, 1)
+
+        response = self.client.post(
+            "/api/token/",
+            {"username": "ana@example.com", "password": "StrongPass123"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.failed_login_attempts, 0)
+        self.assertIsNone(self.user.password_locked_until)
 
     def test_login_creates_auth_session(self):
         self.authenticate()

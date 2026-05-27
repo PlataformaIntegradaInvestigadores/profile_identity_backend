@@ -32,6 +32,12 @@ from .mfa_services import (
     record_mfa_success,
     validate_totp_code,
 )
+from .login_lockout import (
+    get_user_for_password_lockout,
+    is_password_locked,
+    record_password_failure,
+    reset_password_failures,
+)
 from .models import Group, MFAChallenge, ProfileInformation, User, UserMFASettings
 from .profile_services import normalize_contact_info
 from .security_events import emit_security_event
@@ -54,8 +60,24 @@ class UserTokenObtainPairSerializer(TokenObtainPairSerializer):
         request = self.context.get("request")
         username = attrs.get(self.username_field)
         password = attrs.get("password")
+        candidate_user = get_user_for_password_lockout(username)
+        if candidate_user is not None and is_password_locked(candidate_user):
+            emit_security_event(
+                event_type="account_locked",
+                severity="warning",
+                outcome="blocked",
+                request=request,
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                user=candidate_user,
+                reason="password_lockout",
+            )
+            raise AuthenticationFailed(GENERIC_MFA_ERROR, code="authorization")
+
         self.user = authenticate(request=request, **{self.username_field: username, "password": password})
         if self.user is None or not self.user.is_active:
+            failure = None
+            if candidate_user is not None and candidate_user.is_active:
+                failure = record_password_failure(candidate_user)
             emit_security_event(
                 event_type="login_failed",
                 severity="warning",
@@ -64,9 +86,21 @@ class UserTokenObtainPairSerializer(TokenObtainPairSerializer):
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 reason="invalid_credentials",
                 username=username,
+                failed_attempts=failure.failed_attempts if failure else None,
             )
+            if failure and failure.locked_until is not None:
+                emit_security_event(
+                    event_type="account_locked",
+                    severity="warning",
+                    outcome="blocked",
+                    request=request,
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    user=candidate_user,
+                    reason="password_lockout_threshold",
+                )
             raise AuthenticationFailed(GENERIC_MFA_ERROR, code="authorization")
 
+        reset_password_failures(self.user)
         mfa_settings, _ = UserMFASettings.objects.get_or_create(user=self.user)
         if mfa_settings.is_locked:
             emit_security_event(

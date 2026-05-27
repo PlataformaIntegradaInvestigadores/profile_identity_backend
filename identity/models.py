@@ -65,6 +65,8 @@ class User(AbstractBaseUser, PermissionsMixin):
     profile_vector_updated_at = models.DateTimeField(null=True, blank=True)
     interests = models.TextField(null=True, blank=True)
     interaction_count = models.IntegerField(default=0)
+    failed_login_attempts = models.PositiveIntegerField(default=0)
+    password_locked_until = models.DateTimeField(null=True, blank=True)
 
     groups = models.ManyToManyField(
         "auth.Group",
@@ -90,6 +92,10 @@ class User(AbstractBaseUser, PermissionsMixin):
     def get_full_name(self):
         return f"{self.first_name} {self.last_name}".strip()
 
+    @property
+    def is_password_locked(self):
+        return self.password_locked_until is not None and self.password_locked_until > timezone.now()
+
     def save(self, *args, **kwargs):
         if self.scopus_id == "":
             self.scopus_id = None
@@ -99,6 +105,9 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     class Meta:
         db_table = "users"
+        indexes = [
+            models.Index(fields=["password_locked_until"], name="identity_pwd_locked_until"),
+        ]
         constraints = [
             models.UniqueConstraint(
                 fields=["scopus_id"],
