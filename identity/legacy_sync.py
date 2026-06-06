@@ -38,6 +38,9 @@ def send_legacy_sync(path, payload, *, enqueue_on_failure=True):
             headers={"X-Internal-Sync-Token": token},
             timeout=5,
         )
+        if response.status_code == 410:
+            logger.info("Legacy sync endpoint retired for %s; event treated as completed.", path)
+            return True
         response.raise_for_status()
         return True
     except requests.RequestException as exc:
